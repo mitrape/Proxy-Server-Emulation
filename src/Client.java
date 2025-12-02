@@ -46,6 +46,10 @@ public class Client {
             System.out.println("An error occurred...");
             return;
         }
+        if (firstLine.equals("-1")) {
+            System.out.println("Unknown command.");
+            return;
+        }
         System.out.println("Files:\n");
         if (firstLine.equals("END")) {
             System.out.println("no files\n");
