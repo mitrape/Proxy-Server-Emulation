@@ -21,7 +21,7 @@ public class Server {
                 System.out.println("Client connected: " + client.getInetAddress());
                 new Thread(() -> {
                     try {
-                        handleClient(client);
+                        Client(client);
                     } catch (IOException e) {
                         System.out.println("An error occurred...");
                     }
@@ -33,7 +33,7 @@ public class Server {
         }
     }
 
-    private static void handleClient(Socket client) throws IOException {
+    private static void Client(Socket client) throws IOException {
         try (Socket c = client;
              InputStream in = new BufferedInputStream(c.getInputStream());
              OutputStream out = new BufferedOutputStream(c.getOutputStream())) {

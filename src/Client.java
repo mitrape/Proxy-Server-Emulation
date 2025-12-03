@@ -5,7 +5,7 @@ import java.nio.charset.StandardCharsets;
 public class Client {
     public static void main(String[] args) {
         String host = "127.0.0.1";
-        int port = 5000;
+        int port = 4000;
 
         try (Socket socket = new Socket(host, port);
              InputStream in = new BufferedInputStream(socket.getInputStream());
