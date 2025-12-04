@@ -9,20 +9,40 @@ public class ProxyServer {
     private static final int PROXY_PORT = 4000;
     private static final String FILE_SERVER_HOST = "127.0.0.1";
     private static final int FILE_SERVER_PORT = 5000;
+    private static final Map<Integer, NatEntry> natTable = new ConcurrentHashMap<>();
 
-    private static final Map<Integer, SocketAddress> natTable = new ConcurrentHashMap<>();
+    private static class NatEntry {
+        final SocketAddress clientAddr;
 
-    public static void main(String[] args){
+        final InputStream clientIn;
+        final OutputStream clientOut;
+
+        final InputStream serverIn;
+        final OutputStream serverOut;
+
+        NatEntry(Socket clientSocket, Socket serverSocket) throws IOException {
+            this.clientAddr = clientSocket.getRemoteSocketAddress();
+
+            this.clientIn  = new BufferedInputStream(clientSocket.getInputStream());
+            this.clientOut = new BufferedOutputStream(clientSocket.getOutputStream());
+
+            this.serverIn  = new BufferedInputStream(serverSocket.getInputStream());
+            this.serverOut = new BufferedOutputStream(serverSocket.getOutputStream());
+        }
+    }
+
+    public static void main(String[] args) {
         try (ServerSocket proxyListen = new ServerSocket(PROXY_PORT)) {
             System.out.println("Proxy listening on port " + PROXY_PORT);
             while (true) {
-                Socket clientSocket = proxyListen.accept();
-                System.out.println("Client connected to proxy: " + clientSocket.getRemoteSocketAddress());
+                Socket client = proxyListen.accept();
+                System.out.println("Client connected: " + client.getRemoteSocketAddress());
                 new Thread(() -> {
                     try {
-                        Client(clientSocket);
+                        handleClient(client);
                     } catch (IOException e) {
-                        System.out.println("An error occurred...");
+                        System.out.println("Proxy handler error");
+                        try { client.close(); } catch (IOException ignored) {}
                     }
                 }).start();
             }
@@ -30,82 +50,104 @@ public class ProxyServer {
             System.out.println("An error occurred...");
         }
     }
-    private static void Client(Socket clientSocket) throws IOException {
-        int proxyPatPort = -1;
-        try (Socket c = clientSocket;
-             InputStream clientIn = new BufferedInputStream(c.getInputStream());
-             OutputStream clientOut = new BufferedOutputStream(c.getOutputStream());
-             Socket serverSocket = new Socket(FILE_SERVER_HOST, FILE_SERVER_PORT);
-             InputStream serverIn = new BufferedInputStream(serverSocket.getInputStream());
-             OutputStream serverOut = new BufferedOutputStream(serverSocket.getOutputStream())) {
 
-            proxyPatPort = serverSocket.getLocalPort();  //Proxy_Port_New    OS tells this   for example : 61234
-            SocketAddress clientAddr = c.getRemoteSocketAddress();  //(Client_IP, Client_Port)  for example : 192.168.1.10:55012
-            natTable.put(proxyPatPort, clientAddr);
-            System.out.println("NAT ADD: " + clientAddr + " <-> " + proxyPatPort + ")");
+    private static void handleClient(Socket clientSocket) throws IOException {
+        Socket serverSocket = new Socket(FILE_SERVER_HOST, FILE_SERVER_PORT);
+        int proxyPortNew = serverSocket.getLocalPort(); // Proxy_Port_New (OS chooses)
+        NatEntry entry = new NatEntry(clientSocket, serverSocket);
+        natTable.put(proxyPortNew, entry);
 
+        try {
             while (true) {
-                String line = readLineFromStream(clientIn);
-                if (line == null) return;
-                line = line.trim();
-                if (line.isEmpty()) continue;
-                serverOut.write((line + "\n").getBytes(StandardCharsets.UTF_8));
-                serverOut.flush();
-
-                if (line.equals("LIST")) {
-                    LIST(serverIn, clientOut);
-                } else if (line.startsWith("DOWNLOAD ")) {
-                    DOWNLOAD(serverIn, clientOut);
-                } else {
-                    String resp = readLineFromStream(serverIn);  //-1\n
-                    if (resp == null) return;
-                    clientOut.write((resp + "\n").getBytes(StandardCharsets.UTF_8));
-                    clientOut.flush();
-                }
+                //read request from client
+                String request = readLineFromStream(entry.clientIn);
+                if (request == null) return; // client disconnected
+                request = request.trim();
+                if (request.isEmpty()) continue;
+                //send request to server
+                sendLineToServer(proxyPortNew, request);
+                //read response from server and forward to client
+                forwardServerResponse(proxyPortNew);
             }
 
         } finally {
-            if (proxyPatPort != -1) {
-                natTable.remove(proxyPatPort);
+            natTable.remove(proxyPortNew);
+            try { serverSocket.close(); } catch (IOException ignored) {}
+            try { clientSocket.close(); } catch (IOException ignored) {}
+        }
+    }
+
+    private static void forwardServerResponse(int proxyPortNew) throws IOException {
+        NatEntry entry = natTable.get(proxyPortNew);
+        if (entry == null) return;
+
+        String firstLine = readLineFromStream(entry.serverIn);
+        if (firstLine == null) return;
+
+        sendLineToClient(proxyPortNew, firstLine);
+
+        Long sizeMaybe = null;
+        try {
+            sizeMaybe = Long.parseLong(firstLine.trim());
+        } catch (NumberFormatException ignored) {
+            // not a number so it is LIST
+        }
+
+        if (sizeMaybe != null) {
+            // DOWNLOAD response
+            long size = sizeMaybe;
+            if (size < 0) {
+                // -1 is for file not found
+                return;
+            }
+            forwardExactBytes(proxyPortNew, entry.serverIn, size);
+        }
+        else {
+            // LIST response
+            if (firstLine.equals("END") || firstLine.equals("-1")) return;
+            while (true) {
+                String line = readLineFromStream(entry.serverIn);
+                if (line == null) return;
+                sendLineToClient(proxyPortNew, line);
+                if (line.equals("END")) break;
             }
         }
     }
 
-    private static void LIST(InputStream serverIn, OutputStream clientOut) throws IOException {
-        while (true) {
-            String line = readLineFromStream(serverIn);
-            if (line == null) return;
-            clientOut.write((line + "\n").getBytes(StandardCharsets.UTF_8));
-            clientOut.flush();
-            if (line.equals("END")) break;
-        }
+    private static void sendLineToServer(int proxyPortNew, String line) throws IOException {
+        NatEntry entry = natTable.get(proxyPortNew);
+        if (entry == null) return;
+
+        if (!line.endsWith("\n")) line = line + "\n";
+        entry.serverOut.write(line.getBytes(StandardCharsets.UTF_8));
+        entry.serverOut.flush();
     }
 
+    private static void sendLineToClient(int proxyPortNew, String line) throws IOException {
+        NatEntry entry = natTable.get(proxyPortNew);
+        if (entry == null) return;
 
-    private static void DOWNLOAD(InputStream serverIn, OutputStream clientOut) throws IOException {
-        String firstLine = readLineFromStream(serverIn);
-        if (firstLine == null) return;
-        clientOut.write((firstLine + "\n").getBytes(StandardCharsets.UTF_8));
-        clientOut.flush();
-        long size;
-        try {
-            size = Long.parseLong(firstLine.trim());
-        } catch (NumberFormatException e) {
-            System.out.println("An error occurred...");
-            return;
-        }
-        if (size < 0) return;
+        if (!line.endsWith("\n")) line = line + "\n";
+        entry.clientOut.write(line.getBytes(StandardCharsets.UTF_8));
+        entry.clientOut.flush();
+    }
+
+    private static void forwardExactBytes(int proxyPortNew, InputStream serverIn, long size) throws IOException {
+        NatEntry entry = natTable.get(proxyPortNew);
+        if (entry == null) return;
+
         byte[] buffer = new byte[8192];
         long remaining = size;
         while (remaining > 0) {
             int toRead = (int) Math.min(buffer.length, remaining);
             int read = serverIn.read(buffer, 0, toRead);
             if (read == -1) return;
-            clientOut.write(buffer, 0, read);
+            entry.clientOut.write(buffer, 0, read);
             remaining -= read;
         }
-        clientOut.flush();
+        entry.clientOut.flush();
     }
+
     private static String readLineFromStream(InputStream in) throws IOException {
         ByteArrayOutputStream baos = new ByteArrayOutputStream();
         while (true) {
